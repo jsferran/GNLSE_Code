@@ -191,6 +191,155 @@ def _make_mesh_for_time_axis(Nt: int):
     replicate = NamedSharding(mesh, P(None, None, None))  # fully replicated
     return mesh, shard_t, replicate
 
+import jax
+import jax.numpy as jnp
+
+def make_propagate_while_sharded(shard_t, replicate,
+                                 *,
+                                 event_fn=None,
+                                 stop_on_event=True,
+                                 event_check_every: int = 1):
+    """
+    Returns a jitted function that runs a z-loop with optional early stopping on `event_fn`.
+    If `event_fn` is None or stop_on_event=False, no event code is traced at all.
+    """
+    use_event   = bool(callable(event_fn) and stop_on_event)
+    check_every = int(max(1, event_check_every))
+
+    def _materialize_xyt_from_kwo(field_kwo):
+        field_kwo = jax.lax.with_sharding_constraint(field_kwo, replicate)
+        field_xyw = jnp.fft.ifftn(field_kwo, axes=(0,1)).astype(jnp.complex128)
+        field_xyt = jnp.fft.ifft(field_xyw, axis=2).astype(jnp.complex128)
+        return field_xyt
+
+    @partial(
+        jax.jit,
+        static_argnames=('steps_total','save_n','fr','sw','use_gain','m_nl_substeps')
+    )
+    def _propagate_while_sharded(A0_kwo: jnp.ndarray,
+                                 *,
+                                 payload,                 # PyTree
+                                 steps_total: int,
+                                 save_idx: jnp.ndarray, save_n: int,
+                                 dt: float, f0: float,
+                                 fr: float, sw: int,
+                                 deltaZ_NL: float,
+                                 gamma: float,
+                                 omega_vec: jnp.ndarray,
+                                 D_half: jnp.ndarray,
+                                 PML_half: jnp.ndarray,
+                                 Nprop_half: jnp.ndarray,
+                                 hrw: jnp.ndarray,
+                                 gain_term: jnp.ndarray,
+                                 saturation_intensity: float,
+                                 use_gain: bool,
+                                 m_nl_substeps: int):
+
+        field_kwo0 = jax.lax.with_sharding_constraint(A0_kwo, shard_t)
+        Nx, Ny, Nt = A0_kwo.shape
+
+        save_buf0 = jnp.zeros((Nx, Ny, Nt, save_n), dtype=jnp.complex128)
+        save_ptr0 = jnp.array(0, dtype=jnp.int32)
+        i0        = jnp.array(0, dtype=jnp.int32)
+        done0     = jnp.array(False)
+        z_event0  = jnp.array(jnp.nan, dtype=jnp.float64)
+
+        def cond_fun(state):
+            i, field_kwo, save_ptr, save_buf, done, z_event = state
+            return jnp.logical_and(i < steps_total, jnp.logical_not(done))
+
+        def body_fun(state):
+            i, field_kwo, save_ptr, save_buf, done, z_event = state
+
+            # ---- one macro-step (sharded) ----
+            field_kwo = split_step_sharded(
+                field_kwo,
+                shard_t=shard_t, replicate=replicate,
+                dt=dt, f0=f0, fr=fr, sw=sw,
+                deltaZ_NL=deltaZ_NL, gamma=gamma, omega_vec=omega_vec,
+                D_half=D_half, Nprop_half=Nprop_half, PML_half=PML_half,
+                hrw=hrw, gain_term=gain_term,
+                saturation_intensity=saturation_intensity,
+                use_gain=use_gain,
+                m_nl_substeps=m_nl_substeps
+            )
+
+            z_here = (i + 1).astype(jnp.float64) * jnp.asarray(deltaZ_NL, dtype=jnp.float64)
+
+            # decide whether to save this step
+            can_save   = save_ptr < save_n
+            want_index = jnp.where(can_save, save_idx[save_ptr], -1)
+            save_now   = jnp.logical_and(can_save, i == want_index)
+
+            # --- Event gating (PYTHON level) to avoid tracing event_fn when unused ---
+            if use_event:
+                check_now = ((i + 1) % jnp.asarray(check_every, dtype=i.dtype)) == 0
+                need_xyt  = jnp.logical_or(save_now, check_now)
+            else:
+                check_now = jnp.array(False, dtype=bool)
+                need_xyt  = save_now  # no event => only materialize for saving
+
+            # materialize (x,y,t) only if needed
+            def compute_xyt(_):
+                return _materialize_xyt_from_kwo(field_kwo)
+            def dummy_xyt(_):
+                return jnp.zeros((Nx, Ny, Nt), dtype=jnp.complex128)
+
+            field_xyt = jax.lax.cond(need_xyt, compute_xyt, dummy_xyt, operand=None)
+
+            # Save snapshot
+            def do_save(args):
+                save_buf, save_ptr = args
+                save_buf = save_buf.at[..., save_ptr].set(field_xyt)
+                return save_buf, save_ptr + 1
+            def no_save(args):
+                return args
+
+            save_buf, save_ptr = jax.lax.cond(save_now, do_save, no_save, (save_buf, save_ptr))
+
+            # Event check (only built when use_event=True)
+            if use_event:
+                def check_event(_):
+                    return event_fn(field_xyt, z_here, payload)  # must return scalar bool
+                def skip_event(_):
+                    return jnp.array(False)
+                triggered = jax.lax.cond(check_now, check_event, skip_event, operand=None)
+            else:
+                triggered = jnp.array(False)
+
+            done    = jnp.logical_or(done, triggered)
+            z_event = jnp.where(jnp.logical_and(triggered, jnp.isnan(z_event)), z_here, z_event)
+
+            return (i + 1, field_kwo, save_ptr, save_buf, done, z_event)
+
+        i_end, field_end_kwo, save_ptr_end, save_buf, done_end, z_event = jax.lax.while_loop(
+            cond_fun, body_fun, (i0, field_kwo0, save_ptr0, save_buf0, done0, z_event0)
+        )
+
+        # tail fill if requested but not yet written
+        def fill_tail(args):
+            save_buf, field_end_kwo, save_ptr_end = args
+            field_xyt_end = _materialize_xyt_from_kwo(field_end_kwo)
+            save_buf = save_buf.at[..., save_ptr_end].set(field_xyt_end)
+            return save_buf
+        save_buf = jax.lax.cond(save_ptr_end < save_n, fill_tail, lambda x: x[0],
+                                (save_buf, field_end_kwo, save_ptr_end))
+        
+        # If we tail-filled, count is save_ptr_end + 1; else it's save_ptr_end.
+        n_saved = jax.lax.select(save_ptr_end < save_n,
+                                 save_ptr_end + jnp.int32(1),
+                                 save_ptr_end)
+
+        meta = dict(
+            steps_executed=i_end,
+            stopped_early=done_end,
+            z_event=z_event,
+            n_saved=n_saved,            
+        )
+        return save_buf, meta
+    
+    return _propagate_while_sharded
+
 # --- Sharded versions of your step and scan ----------------------------------
 
 @partial(jax.jit,
@@ -345,46 +494,46 @@ def _propagate_scan_sharded(A0_kwo, *,
     return save_buf
 
 # --- Public entry that auto-adapts to device count ---------------------------
-
-def GNLSE3D_propagate(args, A0):
+def GNLSE3D_propagate(args, A0,
+                      *,
+                      event_fn=None,
+                      event_payload=None,
+                      stop_on_event=True,
+                      event_check_every: int = 1):
     """
-    Adaptive-sharded version of GNLSE3D_propagate:
-      - builds a mesh from available devices,
-      - shards along t/omega for spatial FFTs,
-      - replicates for temporal FFTs/NL,
-      - returns saved (x,y,t) complex128 snapshots.
+    Public API with early-stopping event.
+
+    Parameters
+    ----------
+    event_fn : callable or None
+        JAX function (field_xyt, z, payload) -> bool. If None or stop_on_event=False, no early stop.
+    event_payload : PyTree or None
+        Extra data for event_fn (e.g., thresholds, x/y grids).
+    stop_on_event : bool
+        Enable/disable early stop.
+    event_check_every : int
+        Evaluate the event every this many macro steps (>=1).
     """
     prep = _prepare_propagation(args, A0)
+
+    # Spectral initial state
     A0_kwo = jnp.fft.fftn(A0.astype(jnp.complex128), axes=(0,1,2)).astype(jnp.complex128)
 
     # Build mesh/shardings based on Nt and available devices
     _, shard_t, replicate = _make_mesh_for_time_axis(A0_kwo.shape[2])
 
-    # Warmup (JIT compile)
-    _ = _propagate_scan_sharded(
-        A0_kwo,
-        shard_t=shard_t, replicate=replicate,
-        steps_total=prep["steps_total"],
-        save_idx=prep["save_idx"], save_n=prep["save_n"],
-        dt=prep["dt"], f0=prep["f0"],
-        fr=prep["fr"], sw=prep["sw"],
-        deltaZ_NL=prep["deltaZ_NL"],
-        gamma=prep["gamma"],
-        omega_vec=prep["omega_vec"],
-        D_half=prep["D_half"],
-        PML_half=prep["PML_half"],
-        Nprop_half=prep["Nprop_half"],
-        hrw=prep["hrw"],
-        gain_term=prep["gain_term"],
-        saturation_intensity=args["saturation_intensity"],
-        use_gain=prep["use_gain"],
-        m_nl_substeps=prep["m_nl_substeps"]
-    ).block_until_ready()
+    # Build the while-loop propagator with event support (closed over sharding & event)
+    prop_while = make_propagate_while_sharded(
+        shard_t, replicate,
+        event_fn=event_fn,
+        stop_on_event=stop_on_event,
+        event_check_every=event_check_every
+    )
 
-    t0 = time.time()
-    field_saved = _propagate_scan_sharded(
+    # Warmup (JIT compile)
+    _ = prop_while(
         A0_kwo,
-        shard_t=shard_t, replicate=replicate,
+        payload=(event_payload if event_payload is not None else {}),
         steps_total=prep["steps_total"],
         save_idx=prep["save_idx"], save_n=prep["save_n"],
         dt=prep["dt"], f0=prep["f0"],
@@ -400,7 +549,30 @@ def GNLSE3D_propagate(args, A0):
         saturation_intensity=args["saturation_intensity"],
         use_gain=prep["use_gain"],
         m_nl_substeps=prep["m_nl_substeps"]
-    ).block_until_ready()
+    )
+
+    # Timed run
+    t0 = time.time()
+    field_saved, meta = prop_while(
+        A0_kwo,
+        payload=(event_payload if event_payload is not None else {}),
+        steps_total=prep["steps_total"],
+        save_idx=prep["save_idx"], save_n=prep["save_n"],
+        dt=prep["dt"], f0=prep["f0"],
+        fr=prep["fr"], sw=prep["sw"],
+        deltaZ_NL=prep["deltaZ_NL"],
+        gamma=prep["gamma"],
+        omega_vec=prep["omega_vec"],
+        D_half=prep["D_half"],
+        PML_half=prep["PML_half"],
+        Nprop_half=prep["Nprop_half"],
+        hrw=prep["hrw"],
+        gain_term=prep["gain_term"],
+        saturation_intensity=args["saturation_intensity"],
+        use_gain=prep["use_gain"],
+        m_nl_substeps=prep["m_nl_substeps"]
+    )
     elapsed = time.time() - t0
 
-    return dict(field=field_saved, dt=prep["dt"], dx=prep["dx"], seconds=elapsed)
+    return dict(field=field_saved, dt=prep["dt"], dx=prep["dx"], seconds=elapsed, **meta)
+
