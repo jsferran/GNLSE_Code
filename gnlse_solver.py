@@ -1,53 +1,81 @@
-import time;
-from math import pi, sqrt;
+import time
+import jax
+import jax.numpy as jnp
+import numpy as np
+from functools import partial
 
-import jax;
-import jax.numpy as jnp;
-from types import SimpleNamespace;
-from functools import partial;
-from pathlib import Path;
-import numpy as np;
-
-from scipy.sparse.linalg import eigsh, LinearOperator, cg;
-
-jax.config.update("jax_enable_x64", True);
-
+jax.config.update("jax_enable_x64", True)  # ensures float64/complex128 kernels
 
 ##############################################################################################
-# Solver Functions
+# Solver Functions — complex128 everywhere
 ##############################################################################################
-'''
-args:
-    Lx, Ly, Lz, Lt, <- Physical lengths, sim duration [m] [m] [m] [s]
-    Nx, Ny, Nt,     <- Spatiotemporal grid counts (ints)
-    deltaZ,         <- Linear step size [m]
-    deltaZ_NL,      <- Nonlinear step size [m]
-    lambda0,        <- Central wavelength [m]
-    n2,             <- Nonlinear coefficient [m^2 / W]
-    n_xyomega,      <- Frequency-dependent transverse refractive index profile
-    beta0,          <- Propagation constant at lambda0 [m^-1]
-    beta1,          <- First-order dispersion coefficient at lambda0 [m^-2]
-    beta2,          <- Second-order dispersion coefficient at lambda0 [m^-3]
-    gain_coeff,     <- Gain coefficient [m^-1]
-    gain_fwhm,      <- Gain FWHM [Hz]
-    t1, t2,         <- Raman response parameters [s]
-    saturation_intensity, <- Saturation intensity [W/m^2]
-    pml_thickness,  <- PML thickness [m]
-    pml_Wmax,       <- PML maximum absorption [m^-1]    
-    save_at,        <- Array of z positions to save the field at [m]
-'''
+
+def _make_hrw(Nt: int, dt: float, t1 = 12.2e-15, t2 = 32.0e-15, *, dtype=jnp.float64):
+    """Raman response H(ω) as complex128."""
+    t  = dt * jnp.arange(Nt, dtype=dtype)
+    hr = ((t1**2 + t2**2)/(t1 * t2**2)) * jnp.exp(-t/t2) * jnp.sin(t/t1)
+    return jnp.fft.ifft(hr).astype(jnp.complex128) * Nt  # complex128
+
+
+def _dA_dz_NL_rest(A_xy_t,
+                   *, dt: float, f0: float, fr: float, sw: int, gamma: float,
+                   omega_vec: jnp.ndarray, hrw: jnp.ndarray, gain_term: jnp.ndarray,
+                   saturation_intensity: float, use_gain: bool) -> jnp.ndarray:
+    """
+    Residual NL derivative (complex128): Raman + self-steepening + gain/saturation.
+    NOTE: The instantaneous Kerr i*γ|A|^2 A is handled exactly elsewhere and is NOT included here.
+    """
+    Nx, Ny, Nt = A_xy_t.shape
+    absA2_xy_t = jnp.abs(A_xy_t)**2
+    NL_core_xy_t = jnp.zeros_like(A_xy_t, dtype=jnp.complex128)
+
+    # Raman (convolution in time)
+    if fr != 0.0:
+        I_xy_omega = jnp.fft.fft(absA2_xy_t, axis=2).astype(jnp.complex128)   # (Nx,Ny,Nt)
+        H_omega    = hrw[None, None, :]                                        # (1,1,Nt)
+        Raman_xy_t = jnp.fft.ifft(H_omega * I_xy_omega, axis=2)                # (Nx,Ny,Nt)
+        NL_core_xy_t = NL_core_xy_t + (fr * Raman_xy_t) * A_xy_t
+
+    # Self-steepening (acts on NL_core)
+    if sw == 1:
+        NL_core_xy_omega = jnp.fft.fft(NL_core_xy_t, axis=2)
+        NL_core_xy_omega *= (1.0 + omega_vec[None, None, :] / (2.0 * jnp.pi * f0))
+        NL_core_xy_t = jnp.fft.ifft(NL_core_xy_omega, axis=2)
+
+    dA_xy_t = (1j * gamma) * NL_core_xy_t  # complex128
+
+    # Saturable gain with spectral envelope gain_term(ω)
+    def _add_gain(args):
+        dA_xy_t, A_xy_t, absA2_xy_t = args
+        power_xy  = jnp.sum(absA2_xy_t, axis=2) * dt                     # (Nx,Ny) float64
+        gain_pref = 1.0 / (1.0 + power_xy / saturation_intensity)        # (Nx,Ny)
+        gain_pref = gain_pref[:, :, None]                                 # (Nx,Ny,1)
+        A_xy_omega = jnp.fft.fft(A_xy_t, axis=2)
+        # gain_term is (1,1,Nt) or (Nx,Ny,Nt), both broadcast → complex128
+        A_gain_xy_omega = gain_term * (gain_pref * A_xy_omega)
+        return dA_xy_t + jnp.fft.ifft(A_gain_xy_omega, axis=2)
+
+    dA_xy_t = jax.lax.cond(
+        use_gain,
+        _add_gain,
+        lambda args: dA_xy_t,
+        (dA_xy_t, A_xy_t, absA2_xy_t)
+    )
+    return dA_xy_t.astype(jnp.complex128)
+
+
 def _prepare_propagation(args, A0):
-    # Unpack grid
+    """Precompute grids and half-step propagators. All complex arrays are complex128."""
+    # Grid
     Lx, Ly, Lz, Lt = args["Lx"], args["Ly"], args["Lz"], args["Lt"]
     Nx, Ny, Nt     = args["Nx"], args["Ny"], args["Nt"]
     dx, dy, dt     = Lx/Nx, Ly/Ny, Lt/Nt
 
-    deltaZ    = args["deltaZ"]
-    deltaZ_NL = args["deltaZ_NL"]
+    deltaZ    = float(args["deltaZ"])
+    deltaZ_NL = float(args["deltaZ_NL"])
+    steps_total = int(round(Lz / deltaZ))
 
-    steps_total = int(Lz / deltaZ)
-
-    # Map save positions (meters) to integer step indices
+    # Save indices
     save_at_m = np.asarray(args["save_at"], dtype=float)
     save_idx  = np.rint(save_at_m / deltaZ).astype(np.int32)
     save_idx  = np.clip(save_idx, 0, max(0, steps_total - 1))
@@ -57,340 +85,322 @@ def _prepare_propagation(args, A0):
 
     # Physics constants
     c0      = 2.997_924_58e8
-    lambda0 = args["lambda0"]
+    lambda0 = float(args["lambda0"])
     f0      = c0 / lambda0
     omega0  = 2 * jnp.pi * f0
-    n2      = args["n2"]
+    n2      = float(args["n2"])
     gamma   = n2 * omega0 / c0
 
-    beta0, beta1, beta2 = args["beta0"], args["beta1"], args["beta2"]
-    gain_coeff, gain_fwhm = args["gain_coeff"], args["gain_fwhm"]
+    beta0, beta1, beta2 = float(args["beta0"]), float(args["beta1"]), float(args["beta2"])
+    gain_coeff, gain_fwhm = float(args["gain_coeff"]), float(args["gain_fwhm"])
     use_gain = bool(gain_coeff != 0.0)
-    t1, t2 = args["t1"], args["t2"]
+    t1, t2 = float(args["t1"]), float(args["t2"])
 
-    # k / ω grids
-    omega = 2*jnp.pi * jnp.fft.fftfreq(Nt, dt)     # (Nt,)
+    # k / ω grids (float64)
+    omega = 2*jnp.pi * jnp.fft.fftfreq(Nt, dt)     # (Nt,) float64
     kx    = 2*jnp.pi * jnp.fft.fftfreq(Nx, dx)     # (Nx,)
     ky    = 2*jnp.pi * jnp.fft.fftfreq(Ny, dy)     # (Ny,)
 
-    KX    = kx[:, None, None]
-    KY    = ky[None, :, None]
-    OMEGA = omega[None, None, :]
+    KX    = kx[:, None, None]                      # (Nx,1,1)
+    KY    = ky[None, :, None]                      # (1,Ny,1)
+    OMEGA = omega[None, None, :]                   # (1,1,Nt)
 
-    # Dispersion operator D (your formulation)
-    n_xyomega = args["n_xyomega"]                  # (Nx,Ny,Nt)
+    # Material index (x,y,ω)
+    n_xyomega = args["n_xyomega"]                  # expected (Nx,Ny,Nt) float64 or complex
+    n_xyomega = jnp.asarray(n_xyomega, dtype=jnp.float64)
     n_eff_omega = n_xyomega[Nx//2, Ny//2, :]       # (Nt,)
-    beta_eff = n_eff_omega[None,None,:] * (omega0 + OMEGA) / c0
-    rad = beta_eff**2 - KX**2 - KY**2
-    D = 1j * (jnp.sqrt(rad + 0j) - beta0 - beta1 * OMEGA - 0.5 * beta2 * OMEGA**2)
-    D_kxkyomega = jnp.exp(D * deltaZ).astype(jnp.complex64)
+    beta_eff = n_eff_omega[None,None,:] * (omega0 + OMEGA) / c0  # (1,1,Nt)
 
-    # Waveguide + PML factor Nprop
-    pml_thickness = args["pml_thickness"]
-    pml_Wmax      = args["pml_Wmax"]
+    # Spectral generator D(kx,ky,ω) and half-step propagator
+    rad = beta_eff**2 - KX**2 - KY**2
+    D = 1j * (jnp.sqrt(rad + 0.0) - beta0 - beta1*OMEGA - 0.5*beta2*OMEGA**2)  # complex128
+    D_half = jnp.exp(D * (deltaZ/2)).astype(jnp.complex128)                     # (Nx,Ny,Nt)
+
+    # PML (x,y) and waveguide phase (x,y,ω)
+    pml_thickness = int(args["pml_thickness"])
+    pml_Wmax      = float(args["pml_Wmax"])
 
     idx = jnp.arange(Nx); idy = jnp.arange(Ny)
     d_x = jnp.minimum(idx, (Nx-1)-idx)
     d_y = jnp.minimum(idy, (Ny-1)-idy)
     ramp_x = jnp.where(d_x < pml_thickness, pml_Wmax*((pml_thickness-d_x)/pml_thickness)**2, 0.0)
     ramp_y = jnp.where(d_y < pml_thickness, pml_Wmax*((pml_thickness-d_y)/pml_thickness)**2, 0.0)
+    W2d = ramp_x[:,None] + ramp_y[None,:]                                     # (Nx,Ny)
+    PML_half = jnp.exp(-W2d * jnp.float64(deltaZ/2)).astype(jnp.complex128)   # (Nx,Ny)
 
-    W2d = ramp_x[:,None] + ramp_y[None,:]                      # (Nx,Ny)
-    PML2d  = jnp.exp(-W2d * jnp.float64(deltaZ)).astype(jnp.complex64)
+    Nprop_half = jnp.exp(
+        1j*beta_eff/2 * ((n_xyomega/n_eff_omega[None,None,:])**2 - 1.0) * (deltaZ/2)
+    ).astype(jnp.complex128)                                                  # (Nx,Ny,Nt)
 
-    Nprop = jnp.exp(1j*beta_eff/2 * ((n_xyomega/n_eff_omega[None,None,:])**2 - 1) * deltaZ)
-    
+    # Raman kernel (complex128)
+    hrw = _make_hrw(Nt, dt, t1, t2).astype(jnp.complex128)
 
-    # Raman kernel (keep in frequency domain; rfft optional later)
-    hrw = _make_hrw(Nt, dt, t1, t2).astype(jnp.complex64)
-
-    # Gain spectral envelope
-    if gain_coeff == 0.0:
-        gain_term = jnp.zeros_like(OMEGA, dtype=jnp.complex64)
-        use_gain_flag = False
-    else:
-        omega_fwhm = 2.0 * jnp.pi * f0**2 / c0 * gain_fwhm
-        omega_mid  = omega_fwhm / (2 * jnp.sqrt(jnp.log(2)))
+    # Gain spectral envelope g(ω) (use Hz→rad/s: ω_FWHM = 2π * f_FWHM)
+    if use_gain:
+        omega_fwhm = 2.0 * jnp.pi * gain_fwhm
+        omega_mid  = omega_fwhm / (2.0 * jnp.sqrt(jnp.log(2.0)))
         g0 = gain_coeff/2.0
-        gain_term = (g0 * jnp.exp(-(OMEGA**2)/(2*omega_mid**2))).astype(jnp.complex64)
+        gain_term = (g0 * jnp.exp(-(OMEGA**2)/(2*omega_mid**2))).astype(jnp.complex128)  # (1,1,Nt)
         use_gain_flag = True
+    else:
+        gain_term = jnp.zeros((1,1,Nt), dtype=jnp.complex128)
+        use_gain_flag = False
 
-    # Pack everything needed by the z-loop
+    # Residual NL substeps (inside NL stage)
+    m_nl = int(args.get("m_nl_substeps", 1))
+
     prep = dict(
         steps_total=steps_total,
         save_idx=save_idx, save_n=save_n,
-        dt=dt, dx=dx, dy=dy, omega_vec=omega.astype(jnp.complex64),
-        f0=f0, gamma=gamma, PML2d=PML2d,
-        D_kxkyomega=D_kxkyomega.astype(jnp.complex64),
-        Nprop=Nprop.astype(jnp.complex64),
+        dt=jnp.float64(dt), dx=jnp.float64(dx), dy=jnp.float64(dy),
+        omega_vec=omega.astype(jnp.float64),
+        f0=jnp.float64(f0), gamma=jnp.float64(gamma),
+        D_half=D_half, PML_half=PML_half, Nprop_half=Nprop_half,
         hrw=hrw, gain_term=gain_term,
-        fr=args["fr"], sw=args["sw"],
-        num_diffsteps_per_nlstep=int(deltaZ_NL/deltaZ),
-        deltaZ_NL=deltaZ_NL,
+        fr=float(args["fr"]), sw=int(args["sw"]),
+        deltaZ_NL=jnp.float64(deltaZ_NL),
         use_gain=use_gain_flag,
+        m_nl_substeps=m_nl,
     )
     return prep
 
+# --- Adaptive sharding utilities ---------------------------------------------
+import numpy as np
+import jax
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-@partial(
-    jax.jit,
-    static_argnames=('steps_total','save_n', 'fr','sw','num_diffsteps_per_nlstep','use_gain')
-)
-def _propagate_scan(A0,
-                    *,                             # keyword-only args below are constants for XLA
-                    steps_total: int,
-                    save_idx: jnp.ndarray,         # (save_n,)
-                    save_n: int,
-                    dt: float,
-                    f0: float,
-                    fr: float,
-                    sw: int,
-                    deltaZ_NL: float,
-                    num_diffsteps_per_nlstep: int,
-                    gamma: float,
-                    omega_vec: jnp.ndarray,        # (Nt,)
-                    D_kxkyomega: jnp.ndarray,      # (Nx,Ny,Nt)
-                    Nprop: jnp.ndarray,            # (Nx,Ny,Nt)
-                    PML2d,            # (Nx,Ny)
-                    hrw: jnp.ndarray,              # (Nt,)
-                    gain_term: jnp.ndarray,        # (Nx,Ny,Nt)
-                    saturation_intensity: float,
-                    use_gain: bool):
+def _best_1d_factor(n_devices: int, n_axis: int) -> int:
+    """Largest divisor of n_devices that also divides n_axis (>=1)."""
+    best = 1
+    for d in range(1, n_devices + 1):
+        if (n_devices % d == 0) and (n_axis % d == 0):
+            best = d
+    return best
+
+def _make_mesh_for_time_axis(Nt: int):
+    """Create a 1D mesh for sharding along the t/omega axis; fall back to replication."""
+    devs = jax.devices()
+    ndev = len(devs)
+    if ndev == 0:
+        raise RuntimeError("No JAX devices available.")
+    n_shards_t = _best_1d_factor(ndev, Nt)
+    # Use exactly n_shards_t devices (leave extras idle if any).
+    mesh_arr = np.array(devs[:max(1, n_shards_t)]).reshape((max(1, n_shards_t),))
+    mesh = Mesh(mesh_arr, axis_names=('t',))
+    shard_t   = NamedSharding(mesh, P(None, None, 't'))   # shard along Nt (x,y,t)
+    replicate = NamedSharding(mesh, P(None, None, None))  # fully replicated
+    return mesh, shard_t, replicate
+
+# --- Sharded versions of your step and scan ----------------------------------
+
+@partial(jax.jit,
+         static_argnames=('fr','sw','use_gain','m_nl_substeps',
+                          'shard_t','replicate'))
+def split_step_sharded(field_kwo, *,
+                       shard_t, replicate,   # <- stays in signature
+                       dt, f0, fr, sw, deltaZ_NL, gamma, omega_vec,
+                       D_half, Nprop_half, PML_half,
+                       hrw, gain_term, saturation_intensity, use_gain,
+                       m_nl_substeps=1):
     """
-    JIT-compiled z loop using lax.scan. Returns the saved field stack.
+    One Strang macro-step with adaptive sharding:
+      - keep t-sharded for spatial FFTs,
+      - replicate for temporal FFTs + NL,
+      - shard back for next spatial FFTs.
     """
-    Nx, Ny, Nt = A0.shape
-    save_buf0 = jnp.zeros((Nx, Ny, Nt, save_n), dtype=A0.dtype)
+    # Hint the layout for spatial FFTs
+    field_kwo = jax.lax.with_sharding_constraint(field_kwo, shard_t)
+
+    # 1) half L_k (spectral multiply; local)
+    field_kwo = (field_kwo * D_half).astype(jnp.complex128)
+
+    # 2) half L_xy in (x,y,ω) — still t-sharded; 2D IFFT is per-ω batch
+    field_xyw = jnp.fft.ifftn(field_kwo, axes=(0,1)).astype(jnp.complex128)
+    field_xyw = field_xyw * (PML_half[:, :, None]) * Nprop_half
+
+    # 3) replicate for 1D temporal FFT + NL (avoid distributed 1D FFT)
+    field_xyw = jax.lax.with_sharding_constraint(field_xyw, replicate)
+
+    # IFFT_t
+    field_xyt = jnp.fft.ifft(field_xyw, axis=2).astype(jnp.complex128)
+
+    # exact Kerr half-kick
+    def kerr_half_kick(A, dz_half):
+        return (A * jnp.exp(1j * gamma * dz_half * jnp.abs(A)**2)).astype(jnp.complex128)
+
+    field_xyt = kerr_half_kick(field_xyt, 0.5 * deltaZ_NL)
+
+    # residual NL (Heun) for Raman/steepening/gain
+    h = deltaZ_NL / jnp.asarray(m_nl_substeps, dtype=jnp.float64)
+    def residual_heun(A):
+        k1 = _dA_dz_NL_rest(
+            A, dt=dt, f0=f0, fr=fr, sw=sw, gamma=gamma,
+            omega_vec=omega_vec, hrw=hrw, gain_term=gain_term,
+            saturation_intensity=saturation_intensity, use_gain=use_gain
+        )
+        A1 = A + h * k1
+        k2 = _dA_dz_NL_rest(
+            A1, dt=dt, f0=f0, fr=fr, sw=sw, gamma=gamma,
+            omega_vec=omega_vec, hrw=hrw, gain_term=gain_term,
+            saturation_intensity=saturation_intensity, use_gain=use_gain
+        )
+        return (A + 0.5 * h * (k1 + k2)).astype(jnp.complex128)
+
+    def body(_, A):
+        return residual_heun(A)
+
+    field_xyt = jax.lax.fori_loop(0, m_nl_substeps, body, field_xyt)
+
+    # exact Kerr half-kick
+    field_xyt = kerr_half_kick(field_xyt, 0.5 * deltaZ_NL)
+
+    # FFT_t
+    field_xyw = jnp.fft.fft(field_xyt, axis=2).astype(jnp.complex128)
+
+    # 4) shard back along t for spatial FFTs
+    field_xyw = jax.lax.with_sharding_constraint(field_xyw, shard_t)
+
+    # finish L_xy and back to spectral
+    field_xyw = field_xyw * (PML_half[:, :, None]) * Nprop_half
+    field_kwo = jnp.fft.fftn(field_xyw, axes=(0,1)).astype(jnp.complex128)
+
+    # 5) finish L_k
+    field_kwo = (field_kwo * D_half).astype(jnp.complex128)
+    return field_kwo
+
+@partial(jax.jit,
+         static_argnames=('steps_total','save_n','fr','sw','use_gain',
+                          'm_nl_substeps','shard_t','replicate'))
+def _propagate_scan_sharded(A0_kwo, *,
+                            shard_t, replicate,   # <- stays in signature
+                            steps_total, save_idx, save_n,
+                            dt, f0, fr, sw, deltaZ_NL, gamma, omega_vec,
+                            D_half, PML_half, Nprop_half, hrw, gain_term,
+                            saturation_intensity, use_gain, m_nl_substeps):
+
+    """Carries (kx,ky,ω) complex128; saves (x,y,t) complex128 at requested z with proper reshard."""
+    Nx, Ny, Nt = A0_kwo.shape
+    save_buf0 = jnp.zeros((Nx, Ny, Nt, save_n), dtype=jnp.complex128)
     save_ptr0 = jnp.array(0, dtype=jnp.int32)
-    count0    = jnp.array(1, dtype=jnp.int32)
+
+    def _save_snapshot(args):
+        field_kwo, save_ptr, save_buf, i = args
+        # replicate before doing temporal IFFT to materialize full t
+        field_kwo = jax.lax.with_sharding_constraint(field_kwo, replicate)
+        field_xyw = jnp.fft.ifftn(field_kwo, axes=(0,1)).astype(jnp.complex128)
+        field_xyt = jnp.fft.ifft(field_xyw, axis=2).astype(jnp.complex128)
+        save_buf = save_buf.at[..., save_ptr].set(field_xyt)
+        return (field_kwo, save_ptr + 1, save_buf)
+
+    def _skip_save(args):
+        field_kwo, save_ptr, save_buf, i = args
+        return (field_kwo, save_ptr, save_buf)
 
     def body(carry, i):
-        field, count, save_ptr, save_buf = carry
+        field_kwo, save_ptr, save_buf = carry
 
-        # one split-step (your function is already jit-compiled)
-        field, count = split_step(
-            field, count,
+        field_kwo = split_step_sharded(
+            field_kwo,
+            shard_t=shard_t, replicate=replicate,
             dt=dt, f0=f0, fr=fr, sw=sw,
-            deltaZ_NL=deltaZ_NL,
-            num_diffsteps_per_nlstep=num_diffsteps_per_nlstep,
-            gamma=gamma,
-            omega_vec=omega_vec,
-            D_kxkyomega=D_kxkyomega,
-            Nprop=Nprop,
-            PML2d = PML2d,
-            hrw=hrw,
-            gain_term=gain_term,
+            deltaZ_NL=deltaZ_NL, gamma=gamma, omega_vec=omega_vec,
+            D_half=D_half, Nprop_half=Nprop_half, PML_half=PML_half,
+            hrw=hrw, gain_term=gain_term,
             saturation_intensity=saturation_intensity,
-            use_gain=use_gain
+            use_gain=use_gain,
+            m_nl_substeps=m_nl_substeps
         )
-
-        # decide whether to save this step
-        # guard against save_ptr == save_n (no more saves)
-        def _do_save(args):
-            field, count, save_ptr, save_buf, i = args
-            save_buf = save_buf.at[..., save_ptr].set(field)
-            return (field, count, save_ptr+1, save_buf)
-
-        def _skip_save(args):
-            field, count, save_ptr, save_buf, i = args
-            return (field, count, save_ptr, save_buf)
 
         can_save   = save_ptr < save_n
         want_index = jnp.where(can_save, save_idx[save_ptr], -1)
         save_now   = jnp.logical_and(can_save, i == want_index)
 
-        field, count, save_ptr, save_buf = jax.lax.cond(
-            save_now, _do_save, _skip_save, (field, count, save_ptr, save_buf, i)
+        field_kwo, save_ptr, save_buf = jax.lax.cond(
+            save_now, _save_snapshot, _skip_save, (field_kwo, save_ptr, save_buf, i)
         )
 
-        return (field, count, save_ptr, save_buf), None
+        return (field_kwo, save_ptr, save_buf), None
 
-    # scan over all linear steps (0..steps_total-1)
-    (field_end, _, save_ptr_end, save_buf), _ = jax.lax.scan(
+    # Ensure initial placement along t
+    A0_kwo = jax.lax.with_sharding_constraint(A0_kwo, shard_t)
+
+    (field_end_kwo, save_ptr_end, save_buf), _ = jax.lax.scan(
         body,
-        (A0.astype(jnp.complex64), count0, save_ptr0, save_buf0),
+        (A0_kwo, save_ptr0, save_buf0),
         jnp.arange(steps_total, dtype=jnp.int32)
     )
 
-    # If user asked to save more slots than visited (e.g., last step),
-    # you can optionally write the final field into the remaining slot(s).
-    # Here we mimic your original behavior: fill the next slot with final field.
     def _fill_tail(args):
-        save_buf, field_end, save_ptr_end = args
-        save_buf = save_buf.at[..., save_ptr_end].set(field_end)
+        save_buf, field_end_kwo, save_ptr_end = args
+        field_end_kwo = jax.lax.with_sharding_constraint(field_end_kwo, replicate)
+        field_xyw = jnp.fft.ifftn(field_end_kwo, axes=(0,1)).astype(jnp.complex128)
+        field_xyt = jnp.fft.ifft(field_xyw, axis=2).astype(jnp.complex128)
+        save_buf  = save_buf.at[..., save_ptr_end].set(field_xyt)
         return save_buf
-    save_buf = jax.lax.cond(save_ptr_end < save_n, _fill_tail, lambda x: x[0],
-                            (save_buf, field_end, save_ptr_end))
 
-    return save_buf  # shape (Nx,Ny,Nt,save_n)
+    save_buf = jax.lax.cond(
+        save_ptr_end < save_n, _fill_tail, lambda x: x[0],
+        (save_buf, field_end_kwo, save_ptr_end)
+    )
+    return save_buf
 
-def GNLSE3D_propagate_scan(args, A0):
+# --- Public entry that auto-adapts to device count ---------------------------
+
+def GNLSE3D_propagate(args, A0):
+    """
+    Adaptive-sharded version of GNLSE3D_propagate:
+      - builds a mesh from available devices,
+      - shards along t/omega for spatial FFTs,
+      - replicates for temporal FFTs/NL,
+      - returns saved (x,y,t) complex128 snapshots.
+    """
     prep = _prepare_propagation(args, A0)
+    A0_kwo = jnp.fft.fftn(A0.astype(jnp.complex128), axes=(0,1,2)).astype(jnp.complex128)
 
-    # Run once to compile; then time a second run (common pattern)
-    _ = _propagate_scan(
-        A0,
+    # Build mesh/shardings based on Nt and available devices
+    _, shard_t, replicate = _make_mesh_for_time_axis(A0_kwo.shape[2])
+
+    # Warmup (JIT compile)
+    _ = _propagate_scan_sharded(
+        A0_kwo,
+        shard_t=shard_t, replicate=replicate,
         steps_total=prep["steps_total"],
         save_idx=prep["save_idx"], save_n=prep["save_n"],
         dt=prep["dt"], f0=prep["f0"],
         fr=prep["fr"], sw=prep["sw"],
         deltaZ_NL=prep["deltaZ_NL"],
-        num_diffsteps_per_nlstep=prep["num_diffsteps_per_nlstep"],
         gamma=prep["gamma"],
         omega_vec=prep["omega_vec"],
-        D_kxkyomega=prep["D_kxkyomega"],
-        Nprop=prep["Nprop"],
-        PML2d=prep["PML2d"],
+        D_half=prep["D_half"],
+        PML_half=prep["PML_half"],
+        Nprop_half=prep["Nprop_half"],
         hrw=prep["hrw"],
         gain_term=prep["gain_term"],
         saturation_intensity=args["saturation_intensity"],
-        use_gain=prep["use_gain"]
+        use_gain=prep["use_gain"],
+        m_nl_substeps=prep["m_nl_substeps"]
     ).block_until_ready()
 
     t0 = time.time()
-    field_saved = _propagate_scan(
-        A0,
+    field_saved = _propagate_scan_sharded(
+        A0_kwo,
+        shard_t=shard_t, replicate=replicate,
         steps_total=prep["steps_total"],
         save_idx=prep["save_idx"], save_n=prep["save_n"],
         dt=prep["dt"], f0=prep["f0"],
         fr=prep["fr"], sw=prep["sw"],
         deltaZ_NL=prep["deltaZ_NL"],
-        num_diffsteps_per_nlstep=prep["num_diffsteps_per_nlstep"],
         gamma=prep["gamma"],
         omega_vec=prep["omega_vec"],
-        D_kxkyomega=prep["D_kxkyomega"],
-        Nprop=prep["Nprop"],
-        PML2d=prep["PML2d"],
+        D_half=prep["D_half"],
+        PML_half=prep["PML_half"],
+        Nprop_half=prep["Nprop_half"],
         hrw=prep["hrw"],
         gain_term=prep["gain_term"],
         saturation_intensity=args["saturation_intensity"],
-        use_gain=prep["use_gain"]
+        use_gain=prep["use_gain"],
+        m_nl_substeps=prep["m_nl_substeps"]
     ).block_until_ready()
     elapsed = time.time() - t0
 
     return dict(field=field_saved, dt=prep["dt"], dx=prep["dx"], seconds=elapsed)
-
-    
-def _dA_dz_NL( A_xy_t,
-           *, dt,
-           f0, # Hz
-           fr, # Raman fraction
-           sw, # self-steepening flag (0/1)
-           gamma, # W^-1 m
-           omega_vec, # (Nt, Nx, Ny)
-           hrw,       # (Nt,)
-           gain_term,  # (Nt, Nx, Ny)
-           saturation_intensity, # J/m^2
-           use_gain: bool
-         ):
-    
-    Nx, Ny, Nt = A_xy_t.shape;
-
-    # Kerr + Raman:
-    absA2_xy_t = jnp.abs(A_xy_t)**2;
-
-    if fr == 0.0:
-        NL_core_xy_t = absA2_xy_t * A_xy_t
-    else:
-        # FFT along time
-        I_xy_omega = jnp.fft.fft(absA2_xy_t, axis=2)                # (Nx,Ny,Nt)
-        H_omega    = hrw[None, None, :]                              # broadcast
-        Raman_xy_t = jnp.fft.ifft(H_omega * I_xy_omega, axis=2)      # (Nx,Ny,Nt)
-        NL_core_xy_t = ((1.0 - fr) * absA2_xy_t + fr * Raman_xy_t) * A_xy_t;
-
-
-    # Self-steepening:
-    if sw == 1:
-        NL_core_xy_omega = jnp.fft.fft(NL_core_xy_t, axis=2);
-
-        NL_core_xy_omega *= (1.0 + omega_vec[None, None, :] / (2.0 * jnp.pi * f0));
-        NL_core_xy_t = jnp.fft.ifft(NL_core_xy_omega, axis=2);
-    
-    dA_xy_t = 1j * gamma * NL_core_xy_t;
-
-
-    # Saturable gain:
-    def _add_gain(args):
-        dA_xy_t, A_xy_t, absA2_xy_t = args
-        power_xy = jnp.sum(absA2_xy_t, axis=2) * dt
-        gain_pref = 1.0 / (1.0 + power_xy / saturation_intensity)
-        gain_pref = gain_pref[:, :, None]
-        A_xy_omega = jnp.fft.fft(A_xy_t, axis=2)
-        A_gain_xy_omega = gain_term * (gain_pref * A_xy_omega)
-        return dA_xy_t + jnp.fft.ifft(A_gain_xy_omega, axis=2)
-   
-    dA_xy_t = jax.lax.cond(
-        use_gain,
-        _add_gain,
-        lambda args: dA_xy_t,
-        (dA_xy_t, A_xy_t, absA2_xy_t)
-    );
-
-    return dA_xy_t;
-    
-
-
-
-@partial(jax.jit, static_argnames=('fr','sw','num_diffsteps_per_nlstep', 'use_gain'))
-def split_step( field_xy_t,
-                count: int,
-                *,
-                dt : float,
-                f0 : float,
-                fr : float,
-                sw : int,
-                deltaZ_NL : float,
-                num_diffsteps_per_nlstep: int,
-                gamma: float,                     # W^-1 m
-                omega_vec,                       # (Nt,Nx,Ny)
-                D_kxkyomega,                      # (Nx,Ny,Nt)
-                Nprop,                            # (Nx,Ny,Nt)
-                PML2d,
-                hrw,                              # (Nt,)
-                gain_term,                        # (Nt,Nx,Ny)
-                saturation_intensity: float,
-                use_gain : bool
-                ):
-    Nx, Ny, Nt = jnp.shape(field_xy_t);
-
-    
-    # Linear operation of D:
-    field_k = jnp.fft.fftn(field_xy_t, axes=(0,1,2));  # (Nx,Ny,Nt)
-    field_k *= D_kxkyomega;
-    field_xy_t = jnp.fft.ifftn(field_k, axes=(0,1,2));
-
-    # Waveguide + PML factors:
-    field_xy_t *= Nprop;
-    field_xy_t *= PML2d[:, :, None];  # (Nx,Ny,Nt)
-
-
-    ## Nonlinear steps:
-    def _do_nl(operands):
-        field, count = operands
-        dA = deltaZ_NL * _dA_dz_NL(
-            field, dt=dt, f0=f0, fr=fr, gamma=gamma, sw=sw,
-            omega_vec=omega_vec, hrw=hrw, gain_term=gain_term,
-            saturation_intensity=saturation_intensity, use_gain=use_gain
-        )
-        # reset counter to 1 with the SAME dtype as `count`
-        return field + dA, jnp.asarray(1, dtype=count.dtype)
-
-    def _skip_nl(operands):
-        field, count = operands
-        # increment by 1 with the SAME dtype
-        return field, count + jnp.asarray(1, dtype=count.dtype)
-
-    # ensure the rhs of the comparison has the SAME dtype as `count`
-    trigger = count == jnp.asarray(num_diffsteps_per_nlstep, dtype=count.dtype)
-    field_xy_t, new_count = jax.lax.cond(
-        trigger, _do_nl, _skip_nl, (field_xy_t, count)
-    )
-
-    return field_xy_t, new_count
-
-
-def _make_hrw(Nt: int, dt: float, t1 = 12.2e-15, t2 = 32.0e-15, *, dtype=jnp.float64):
-    """Raman response H(ω)."""
-    t  = dt * jnp.arange(Nt, dtype=dtype);
-    hr = ((t1**2 + t2**2)/(t1 * t2**2)) * jnp.exp(-t/t2) * jnp.sin(t/t1);
-    return jnp.fft.ifft(hr) * Nt;

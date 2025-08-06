@@ -214,3 +214,161 @@ def power_vs_time_from_results(results, z_index=-1, dx=None, dy=None):
     return np.real_if_close(P_t, tol=1000)
 
 
+
+def make_xy_z_animation(field4d,
+                        t_index=-1,
+                        x=None, y=None, z=None,
+                        quantity='intensity',      # 'intensity' (|E|^2), 'abs', 'real', 'imag', 'phase'
+                        norm='global',             # 'global' or 'per_frame'
+                        z_window=None,             # (z_start, z_end) in same units as z (ignored if z is None)
+                        frame_window=None,         # (i_start, i_end) inclusive/exclusive frame indices
+                        stride=1,                  # take every 'stride' frame in the selected window
+                        fps=30,
+                        filename='xy_z.gif',
+                        dpi=120):
+    """
+    Animate the transverse (x,y) field vs propagation distance z at a fixed time index t.
+
+    Parameters
+    ----------
+    field4d : np.ndarray, complex, shape (Nx, Ny, Nt, Nz)
+        The complex field.
+    t_index : int
+        Which time slice to animate (default last).
+    x, y : 1D arrays or None
+        Spatial axes (used only for labeling/extent). If None, pixel indices are used.
+    z : 1D array or None
+        z axis. Required to use z_window. If None, you can use frame_window instead.
+    quantity : str
+        'intensity', 'abs', 'real', 'imag', or 'phase'.
+    norm : str
+        'global' -> single color scale over displayed frames;
+        'per_frame' -> auto-scale each frame independently.
+    z_window : tuple or None
+        (z_start, z_end) limits the animation to this physical z window. Requires `z`.
+        Both endpoints are inclusive of the nearest sample.
+    frame_window : tuple or None
+        (i_start, i_end) frame indices along z. i_end follows Python slicing (exclusive).
+        Ignored if z_window is provided.
+    stride : int
+        Use every `stride`-th frame within the selected window (for decimating long sequences).
+    fps : int
+        Frames per second for the GIF.
+    filename : str
+        Output GIF path.
+    dpi : int
+        Figure DPI for saving.
+
+    Returns
+    -------
+    filename : str
+        Path to the saved GIF.
+    """
+
+    assert field4d.ndim == 4, "Expected (Nx, Ny, Nt, Nz)."
+    Nx, Ny, Nt, Nz = field4d.shape
+    if not (-Nt <= t_index < Nt):
+        raise IndexError(f"t_index {t_index} out of range for Nt={Nt}")
+
+    # Extract the (x,y,z) block at fixed t
+    F = field4d[:, :, t_index, :]  # (Nx, Ny, Nz)
+
+    # Map to requested quantity
+    if quantity == 'intensity':
+        data_z = np.abs(F)**2
+        cbar_label = r'|E|$^2$'
+    elif quantity == 'abs':
+        data_z = np.abs(F)
+        cbar_label = r'|E|'
+    elif quantity == 'real':
+        data_z = np.real(F)
+        cbar_label = 'Re{E}'
+    elif quantity == 'imag':
+        data_z = np.imag(F)
+        cbar_label = 'Im{E}'
+    elif quantity == 'phase':
+        data_z = np.angle(F)
+        cbar_label = 'arg(E)'
+    else:
+        raise ValueError("quantity must be one of: 'intensity', 'abs', 'real', 'imag', 'phase'")
+
+    # Determine the z/frame subset
+    if z_window is not None:
+        if z is None:
+            raise ValueError("z_window was provided but `z` axis is None.")
+        z = np.asarray(z)
+        if len(z) != Nz:
+            raise ValueError("Length of `z` must match Nz dimension of field.")
+        z_start, z_end = z_window
+        if z_start > z_end:
+            z_start, z_end = z_end, z_start
+        i0 = int(np.clip(np.searchsorted(z, z_start, side='left'), 0, Nz-1))
+        i1 = int(np.clip(np.searchsorted(z, z_end,   side='right'), 0, Nz))  # exclusive
+    elif frame_window is not None:
+        i0, i1 = frame_window
+        i0 = int(np.clip(i0, 0, Nz))
+        i1 = int(np.clip(i1, i0+1, Nz))  # ensure at least one frame if possible
+    else:
+        i0, i1 = 0, Nz
+
+    # Apply stride
+    frame_indices = np.arange(i0, i1, stride, dtype=int)
+    if frame_indices.size == 0:
+        raise ValueError("Selected z/frame window is empty after applying stride.")
+
+    data_sel = data_z[..., frame_indices]              # (Nx, Ny, Nf)
+    z_sel = z[frame_indices] if (z is not None and len(z) == Nz) else None
+    Nf = data_sel.shape[-1]
+
+    # Axes extents for imshow
+    if x is not None and y is not None:
+        x = np.asarray(x); y = np.asarray(y)
+        extent = [x.min(), x.max(), y.min(), y.max()]
+        xlabel, ylabel = 'x', 'y'
+    else:
+        extent = None
+        xlabel, ylabel = 'pixel x', 'pixel y'
+
+    # Normalization over the displayed frames
+    if norm == 'global':
+        vmin = np.nanmin(data_sel)
+        vmax = np.nanmax(data_sel)
+        if vmax == vmin:
+            vmax = vmin + (1e-12 if np.isfinite(vmin) else 1.0)
+    elif norm == 'per_frame':
+        vmin = vmax = None
+    else:
+        raise ValueError("norm must be 'global' or 'per_frame'")
+
+    # Prepare figure
+    fig, ax = plt.subplots()
+    im = ax.imshow(data_sel[..., 0].T, origin='lower', extent=extent, vmin=vmin, vmax=vmax)
+    ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
+    if z_sel is not None:
+        title = ax.set_title(f"t index = {t_index}, z = {z_sel[0]}")
+    else:
+        title = ax.set_title(f"t index = {t_index}, frame = {frame_indices[0]}")
+
+    # Colorbar
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label(cbar_label)
+
+    # Frame update
+    def update(k):
+        frame_data = data_sel[..., k]
+        if norm == 'per_frame':
+            im.set_clim(np.nanmin(frame_data), np.nanmax(frame_data))
+        im.set_data(frame_data.T)
+        if z_sel is not None:
+            title.set_text(f"t index = {t_index}, z = {z_sel[k]}")
+        else:
+            title.set_text(f"t index = {t_index}, frame = {frame_indices[k]}")
+        return (im,)
+
+    anim = FuncAnimation(fig, update, frames=Nf, interval=1000.0/fps, blit=False)
+
+    # Save as GIF
+    writer = PillowWriter(fps=fps)
+    anim.save(filename, writer=writer, dpi=dpi)
+    plt.close(fig)
+    return filename
