@@ -257,29 +257,24 @@ def cw_temp_profile_freq(lambdas, phis, Lt, Nt, amplitudes=None, dtype=jnp.compl
     Et = jnp.fft.ifft(Ew)    # time-domain complex envelope
     return Et.astype(dtype)
 
-def gaussian_pulse_profile_freq(t0, fwhm, Lt, Nt, carrier_omega=0.0, phase=0.0, dtype=jnp.complex128):
+def gaussian_pulse_profile_freq(t0, fwhm, Lt, Nt, *,
+                                carrier_omega=0.0, phase=0.0,
+                                center_in_window=True,
+                                dtype=jnp.complex128):
     """
-    Transform-limited Gaussian pulse built in frequency domain.
-    Time FWHM = fwhm. Center time shift = t0. Optional carrier_omega shift and overall phase.
-    Returns complex envelope E(t) sampled over Lt with Nt points.
+    Transform-limited Gaussian built in frequency domain on a [0, Lt) grid with Nt samples.
+    If center_in_window=True, the pulse peak is at t = Lt/2 (so it doesn't wrap).
     """
-    omega, dt = _fft_omega_grid(Lt, Nt)
-
-    # time-domain Gaussian sigma (std) from FWHM
+    omega, dt = _fft_omega_grid(Lt, Nt)  # omega = 2π * fftfreq(Nt, dt)
     sigma_t = fwhm / (2 * jnp.sqrt(2 * jnp.log(2)))
 
-    # Spectrum of a unit-peak Gaussian in time (up to overall scaling).
-    # If E(t) = exp(-(t)^2/(2σ_t^2)), then  Ẽ(Ω) ∝ exp(-(σ_t^2 Ω^2)/2).
-    # Time shift t0 -> multiply by exp(-i Ω t0). Global phase -> multiply by exp(i phase).
-    Ew = jnp.exp(-0.5 * (sigma_t**2) * (omega**2)) * jnp.exp(-1j * omega * t0) * jnp.exp(1j * phase)
+    # place the Gaussian in frequency at carrier_omega
+    # time shift by t_shift: multiply by exp(-i ω t_shift)
+    t_shift = t0 + (0.5 * Lt if center_in_window else 0.0)
 
-    # Optional carrier: shift spectrum by k0 bins (circularly) to center at carrier_omega.
-    if carrier_omega != 0.0:
-        k0 = _freq_to_bin(carrier_omega, Lt, Nt)
-        # roll Ew so its peak is at k0; equivalent to multiplying by exp(i carrier_omega t) in time.
-        Ew = jnp.roll(Ew, k0)
+    Ew = jnp.exp(-0.5 * (sigma_t**2) * (omega - carrier_omega)**2) \
+         * jnp.exp(-1j * omega * t_shift) * jnp.exp(1j * phase)
 
-    # Normalize so that the time-domain pulse has unit peak (or any desired scale you prefer).
     Et = jnp.fft.ifft(Ew)
     Et = Et / jnp.max(jnp.abs(Et))  # unit peak
     return Et.astype(dtype)

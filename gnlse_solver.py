@@ -3,6 +3,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from functools import partial
+import matplotlib.pyplot as plt
 
 jax.config.update("jax_enable_x64", True)  # ensures float64/complex128 kernels
 
@@ -127,6 +128,9 @@ def _prepare_propagation(args, A0):
     ramp_y = jnp.where(d_y < pml_thickness, pml_Wmax*((pml_thickness-d_y)/pml_thickness)**2, 0.0)
     W2d = ramp_x[:,None] + ramp_y[None,:]                                     # (Nx,Ny)
     PML_half = jnp.exp(-W2d * jnp.float64(deltaZ/2)).astype(jnp.complex128)   # (Nx,Ny)
+    #print(PML_half)
+    #plt.imshow(jnp.real(PML_half), cmap='gray', origin='lower')
+    #plt.show
 
     Nprop_half = jnp.exp(
         1j*beta_eff/2 * ((n_xyomega/n_eff_omega[None,None,:])**2 - 1.0) * (deltaZ/2)
@@ -378,6 +382,7 @@ def split_step_sharded(field_kwo, *,
         return (A * jnp.exp(1j * gamma * dz_half * jnp.abs(A)**2)).astype(jnp.complex128)
 
     field_xyt = kerr_half_kick(field_xyt, 0.5 * deltaZ_NL)
+
 
     # residual NL (Heun) for Raman/steepening/gain
     h = deltaZ_NL / jnp.asarray(m_nl_substeps, dtype=jnp.float64)
