@@ -26,73 +26,6 @@ def _resolve_precision(precision: str | None):
 C0 = 299_792_458.0
 LN10_OVER_10 = np.log(10)/10
 
-# --------------------------------------------------------------------------------------
-# Loss model — robust to long-IR overflow (prevents inf/NaN growth)
-# --------------------------------------------------------------------------------------
-def silica_alpha_lambda(
-    lam_m,
-    rayleigh_dBkm_1550=0.18,
-    oh_lines=((1383e-9, 2.0, 25e-9), (1240e-9, 1.0, 20e-9)),
-    ir_turn_on=2.5e-6,
-    ir_A=5.0,
-    ir_L=0.25e-6,
-    lam_clip_max=6.0e-6,   # cap modeled wavelength (prevents absurd exponents)
-    exp_clip_fp32=80.0,    # safe exp range for float32
-    exp_clip_fp64=700.0,   # safe exp range for float64
-):
-    lam = np.asarray(lam_m, float)
-    lam = np.minimum(lam, lam_clip_max)  # guard long-IR
-
-    lam_um = lam*1e6
-    alpha_ray_dBkm = rayleigh_dBkm_1550 * (1.55/lam_um)**4
-
-    def gauss(x, mu, fwhm, A):
-        sig = fwhm/(2*np.sqrt(2*np.log(2)))
-        return A*np.exp(-0.5*((x-mu)/sig)**2)
-
-    alpha_oh_dBkm = 0.0
-    for mu, peak, fwhm in oh_lines:
-        alpha_oh_dBkm += gauss(lam, mu, fwhm, peak)
-
-    alpha_lin = LN10_OVER_10*(alpha_ray_dBkm + alpha_oh_dBkm)/1000.0  # m^-1
-
-    # Multiphonon tail with dtype-aware clipping
-    s = (lam - ir_turn_on)/max(ir_L, 1e-12)
-    if np.finfo(float).bits == 64:
-        s = np.clip(s, -exp_clip_fp64, exp_clip_fp64)
-    else:
-        s = np.clip(s, -exp_clip_fp32, exp_clip_fp32)
-    alpha_lin += ir_A*np.exp(s)
-    return alpha_lin  # m^-1
-
-
-def build_alpha_w(args, **model_kwargs):
-    Nt = int(args["Nt"]); dt = float(args["Lt"])/Nt
-    f0 = C0/float(args["lambda0"])
-    df = np.fft.fftfreq(Nt, d=dt)
-    f_abs = f0 + np.fft.fftshift(df)
-    lam = C0/np.maximum(np.abs(f_abs), 1.0)  # avoid 0 Hz → ∞ λ
-    lam = np.clip(lam, None, model_kwargs.get("lam_clip_max", 6e-6))
-    alpha_lam = silica_alpha_lambda(lam, **model_kwargs)
-    return np.fft.ifftshift(alpha_lam).astype(np.float64)  # unshifted FFT grid
-
-
-def build_long_ir_sponge_mask(args, lam_soft_um=2.6, lam_hard_um=3.2, extra_alpha_m1=100.0, dz=1e-4):
-    Nt = int(args["Nt"]); dt = float(args["Lt"])/Nt
-    lam0 = float(args["lambda0"]); f0 = C0/lam0
-    df = np.fft.fftfreq(Nt, d=dt)
-    f_abs = f0 + np.fft.fftshift(df)
-    lam = C0/np.maximum(np.abs(f_abs), 1.0)
-
-    # Smoothstep ramp from lam_soft to lam_hard
-    ls, lh = lam_soft_um*1e-6, lam_hard_um*1e-6
-    t = np.clip((lam-ls)/(lh-ls), 0.0, 1.0)
-    s = t*t*(3 - 2*t)
-
-    # field factor = exp(-0.5*alpha*dz)
-    mask_shifted = np.exp(-0.5*extra_alpha_m1*s*dz)
-    return np.fft.ifftshift(mask_shifted).astype(np.float64)
-
 
 # --------------------------------------------------------------------------------------
 # Raman kernel (fft of causal response) — dtype-aware
@@ -162,30 +95,7 @@ def _prepare_propagation(args, A0, *, precision: str = "fp64"):
     deltaZ_NL     = float(args["deltaZ_NL"])
     steps_total   = int(round(Lz / deltaZ_linear))
 
-    # Spectral loss α(ω)
-    alpha_w_np = None
-    if "alpha_w" in args and args["alpha_w"] is not None:
-        alpha_w_np = np.asarray(args["alpha_w"], dtype=NPD)
-        if alpha_w_np.shape != (Nt,):
-            raise ValueError(f"alpha_w must be shape (Nt,), got {alpha_w_np.shape}")
-    elif bool(args.get("use_alpha_w", False)):
-        alpha_w_np = build_alpha_w(args, **args.get("alpha_model", {})).astype(NPD)
 
-    if alpha_w_np is not None:
-        # amplitude half-step: exp(-α Δz / 4)
-        Loss_half = jnp.exp(-jnp.asarray(alpha_w_np, RD) * RD(deltaZ_linear*0.25))
-        Loss_half = Loss_half[None, None, :]     # real RD
-    else:
-        Loss_half = jnp.ones((1,1,Nt), dtype=RD)
-
-    # Long-IR sponge (optional)
-    sponge_np = None
-    if bool(args.get("use_ir_sponge", False)):
-        sponge_np = build_long_ir_sponge_mask(args, dz=deltaZ_linear/2.0, **args.get("sponge_kwargs", {})).astype(NPD)
-    if sponge_np is not None:
-        Sponge_half = jnp.asarray(sponge_np, RD)[None, None, :]
-    else:
-        Sponge_half = jnp.ones((1,1,Nt), dtype=RD)
 
     # Save indices
     save_at_m = np.asarray(args["save_at"], dtype=np.float64)
@@ -275,8 +185,6 @@ def _prepare_propagation(args, A0, *, precision: str = "fp64"):
         f0=RD(C0/float(args["lambda0"])),
         gamma=RD(gamma),
         D_half=D_half, PML_half=PML_half, Nprop_half=Nprop_half,
-        Loss_half=Loss_half.astype(RD),
-        Sponge_half=(Sponge_half.astype(RD)),
         hrw=hrw, gain_term=gain_term,
         fr=float(args["fr"]), sw=int(args["sw"]),
         deltaZ_linear=RD(deltaZ_linear),
@@ -369,8 +277,6 @@ def make_propagate_scan_sharded_checkpointed(
         segment_len: int = 16,
         tree_depth: int = 2,
         base_len: int = 32,
-        Loss_half: jnp.ndarray = None,
-        Sponge_half: jnp.ndarray = None,
         save_as_fp32: bool = False,
     ):
         CD_sim = A0_kwo.dtype
@@ -404,8 +310,6 @@ def make_propagate_scan_sharded_checkpointed(
                 m_nl_substeps=m_nl_substeps,
                 nl_outer_subcycles=nl_outer_subcycles,
                 apply_nl=apply_nl,
-                Loss_half=Loss_half,
-                Sponge_half=Sponge_half,
             )
 
             z_here = (i + 1).astype(z_event.dtype) * deltaZ_linear
@@ -536,29 +440,24 @@ def split_step_sharded(field_kwo, *,
                        m_nl_substeps=1,
                        nl_outer_subcycles=1,
                        apply_nl=True,
-                       Loss_half=None,
-                       Sponge_half=None):
+                       ):
 
     CD = field_kwo.dtype
     RD = jnp.float32 if CD == jnp.complex64 else jnp.float64
     ONEJ = jax.lax.complex(RD(0.0), RD(1.0))
 
-    if Loss_half is None:
-        Loss_half = jnp.ones_like(field_kwo[0:1,0:1,:], dtype=RD)
-    if Sponge_half is None:
-        Sponge_half = jnp.ones_like(field_kwo[0:1,0:1,:], dtype=RD)
+    
 
     # 1) half L_k + masks
     field_kwo = jax.lax.with_sharding_constraint(field_kwo, shard_t)
     field_kwo = field_kwo * D_half
-    field_kwo = field_kwo * Loss_half.astype(CD)
-    field_kwo = field_kwo * Sponge_half.astype(CD)
+    
 
     # 2) half L_xy
     field_xyw = jnp.fft.ifftn(field_kwo, axes=(0,1))
     field_xyw = field_xyw * (PML_half[:, :, None].astype(RD)) * Nprop_half
 
-    def _do_nl(field_xyw_local):
+    def _do_nl(field_xyw_local, apply_residual: bool):
         field_xyw_rep = jax.lax.with_sharding_constraint(field_xyw_local, replicate)
         field_xyt = jnp.fft.ifft(field_xyw_rep, axis=2)
 
@@ -583,16 +482,19 @@ def split_step_sharded(field_kwo, *,
         dz = deltaZ_linear / m
 
         def one_cycle(A,_):
-            A = kerr_half(A, dz)
-            A = residual_heun(A, dz)
-            A = kerr_half(A, dz)
+            A = kerr_half(A, dz)                                # ← always
+            A = jax.lax.cond(apply_residual,
+                            lambda a: residual_heun(a, dz),
+                            lambda a: a,
+                            A)
+            A = kerr_half(A, dz)                                # ← always
             return A, None
 
         field_xyt, _ = jax.lax.scan(one_cycle, field_xyt, xs=None, length=m)
-        field_xyw2 = jnp.fft.fft(field_xyt, axis=2)
-        return field_xyw2
+        return jnp.fft.fft(field_xyt, axis=2)
 
-    field_xyw = jax.lax.cond(apply_nl, _do_nl, lambda x: x, field_xyw)
+
+    field_xyw = _do_nl(field_xyw, apply_residual=apply_nl)
     field_xyw = jax.lax.with_sharding_constraint(field_xyw, shard_t)
 
     # finish L_xy and go back to spectral
@@ -601,8 +503,6 @@ def split_step_sharded(field_kwo, *,
 
     # 5) finish L_k + masks
     field_kwo = field_kwo * D_half
-    field_kwo = field_kwo * Loss_half.astype(CD)
-    field_kwo = field_kwo * Sponge_half.astype(CD)
     return field_kwo
 
 # --------------------------------------------------------------------------------------
@@ -614,7 +514,7 @@ def GNLSE3D_propagate(
     event_fn=None,
     event_payload=None,
     stop_on_event=True,
-    event_check_every: int = 1,
+    event_check_every: int = 1e10,
     ckpt_strategy: str | None = None,
     ckpt_segment_len: int | None = None,
     ckpt_tree_depth: int | None = None,
@@ -649,35 +549,8 @@ def GNLSE3D_propagate(
         base_len=int(baselen),
     )
 
-    # Warmup compile (small run to specialize shapes/dtypes)
-    _ = prop_scan(
-        A0_kwo,
-        payload=(event_payload if event_payload is not None else {}),
-        steps_total=prep["steps_total"],
-        save_idx=prep["save_idx"], save_n=prep["save_n"],
-        dt=prep["dt"], f0=prep["f0"],
-        fr=prep["fr"], sw=prep["sw"],
-        deltaZ_linear=prep["deltaZ_linear"],
-        deltaZ_NL=prep["deltaZ_NL"],
-        gamma=prep["gamma"],
-        omega_vec=prep["omega_vec"],
-        D_half=prep["D_half"],
-        PML_half=prep["PML_half"],
-        Nprop_half=prep["Nprop_half"],
-        hrw=prep["hrw"],
-        gain_term=prep["gain_term"],
-        saturation_intensity=args["saturation_intensity"],
-        use_gain=prep["use_gain"],
-        m_nl_substeps=prep["m_nl_substeps"],
-        nl_outer_subcycles=prep["nl_outer_subcycles"],
-        skip_nl_every=prep["skip_nl_every"],
-        strategy=strategy, segment_len=int(seglen), tree_depth=int(treedepth), base_len=int(baselen),
-        Loss_half=prep["Loss_half"],
-        Sponge_half=prep["Sponge_half"],
-        save_as_fp32=bool(save_as_fp32),
-    )
 
-    # Timed run
+        # Timed run
     t0 = time.time()
     field_saved, meta = prop_scan(
         A0_kwo,
@@ -701,8 +574,6 @@ def GNLSE3D_propagate(
         nl_outer_subcycles=prep["nl_outer_subcycles"],
         skip_nl_every=prep["skip_nl_every"],
         strategy=strategy, segment_len=int(seglen), tree_depth=int(treedepth), base_len=int(baselen),
-        Loss_half=prep["Loss_half"],
-        Sponge_half=prep["Sponge_half"],
         save_as_fp32=bool(save_as_fp32),
     )
     elapsed = time.time() - t0
